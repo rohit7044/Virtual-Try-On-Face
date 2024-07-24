@@ -1,11 +1,15 @@
+# AUTHOR: ROHIT DAS
+
 import cv2
 import mediapipe
 
 # CONSTANTS
 
 # Landmarks from mesh_map.jpg
-LEFT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 246, 466, 388, 387, 386, 385, 384, 398]
-RIGHT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+LEFT_EYE = [353]
+RIGHT_EYE = [124]
+MIDDLE_FOREHEAD_POINT = [168]
+
 
 mediapipe_face_mesh = mediapipe.solutions.face_mesh
 
@@ -25,7 +29,12 @@ def detect_eyes(frame):
             cv2.circle(frame, (int(landmarks[i].x * frame.shape[1]), int(landmarks[i].y * frame.shape[0])), 1,
                        (0, 0, 255), 1)
 
+        for i in MIDDLE_FOREHEAD_POINT:
+            cv2.circle(frame, (int(landmarks[i].x * frame.shape[1]), int(landmarks[i].y * frame.shape[0])), 1,
+                       (0, 0, 255), 1)
+
     return frame
+
 
 # Test code for view_landmarks.py
 
