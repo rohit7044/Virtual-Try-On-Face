@@ -2,161 +2,117 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import trimesh
-import OpenGL.GL as gl
-import OpenGL.GLUT as glut
-import OpenGL.GLU as glu
-import pyrr
 
 
-class VirtualGlasses:
-    def __init__(self):
+class GlassesRenderer:
+    def __init__(self, glasses_model_path):
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            raise Exception("Could not open video device")
+
         self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+        self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1,
+                                                    min_detection_confidence=0.5)
+
+        self.glasses_model = trimesh.load(glasses_model_path)
+
+    def detect_face_landmarks(self, image):
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_image)
+        if not results.multi_face_landmarks:
+            return None
+        return results.multi_face_landmarks[0]
+
+    def calculate_pose(self, landmarks, width, height):
+        # 3D model points
+        model_points = np.array([
+            (0.0, 0.0, 0.0),  # Nose tip
+            (0.0, -330.0, -65.0),  # Chin
+            (-225.0, 170.0, -135.0),  # Left eye left corner
+            (225.0, 170.0, -135.0),  # Right eye right corner
+            (-150.0, -150.0, -125.0),  # Left Mouth corner
+            (150.0, -150.0, -125.0)  # Right mouth corner
+        ])
+
+        # 2D image points
+        image_points = np.array([
+            (landmarks.landmark[4].x * width, landmarks.landmark[4].y * height),  # Nose tip
+            (landmarks.landmark[152].x * width, landmarks.landmark[152].y * height),  # Chin
+            (landmarks.landmark[33].x * width, landmarks.landmark[33].y * height),  # Left eye left corner
+            (landmarks.landmark[263].x * width, landmarks.landmark[263].y * height),  # Right eye right corner
+            (landmarks.landmark[61].x * width, landmarks.landmark[61].y * height),  # Left Mouth corner
+            (landmarks.landmark[291].x * width, landmarks.landmark[291].y * height)  # Right mouth corner
+        ], dtype="double")
+
+        # Camera internals
+        focal_length = width
+        center = (width / 2, height / 2)
+        camera_matrix = np.array(
+            [[focal_length, 0, center[0]],
+             [0, focal_length, center[1]],
+             [0, 0, 1]], dtype="double"
         )
 
-        self.cap = cv2.VideoCapture(0)
-        success, frame = self.cap.read()
-        if not success:
-            raise Exception("Could not initialize camera")
+        dist_coeffs = np.zeros((4, 1))  # Assuming no lens distortion
+        (success, rotation_vector, translation_vector) = cv2.solvePnP(model_points, image_points, camera_matrix,
+                                                                      dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
 
-        self.frame_height, self.frame_width = frame.shape[:2]
+        return rotation_vector, translation_vector, camera_matrix, dist_coeffs
 
-        self.glasses_model = None
-        self.load_glasses_model()
+    def render_glasses(self, image, landmarks):
+        height, width = image.shape[:2]
+        (rotation_vector, translation_vector, camera_matrix, dist_coeffs) = self.calculate_pose(landmarks, width,
+                                                                                                height)
 
-        # Initialize GLUT
-        glut.glutInit()
-        glut.glutInitDisplayMode(glut.GLUT_DOUBLE | glut.GLUT_RGB | glut.GLUT_DEPTH)
-        glut.glutInitWindowSize(self.frame_width, self.frame_height)
-        glut.glutCreateWindow(b"Virtual Glasses")
+        glasses_3d = self.glasses_model.vertices
+        (glasses_2d, _) = cv2.projectPoints(glasses_3d, rotation_vector, translation_vector, camera_matrix, dist_coeffs)
 
-        # Set up OpenGL context
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glMatrixMode(gl.GL_PROJECTION)
-        gl.glLoadIdentity()
-        glu.gluPerspective(45, (self.frame_width / self.frame_height), 0.1, 50.0)
-        gl.glMatrixMode(gl.GL_MODELVIEW)
-        gl.glLoadIdentity()
+        left_eye = np.array([landmarks.landmark[33].x, landmarks.landmark[33].y]) * [width, height]
+        right_eye = np.array([landmarks.landmark[263].x, landmarks.landmark[263].y]) * [width, height]
+        eye_distance = np.linalg.norm(right_eye - left_eye)
 
-    def load_glasses_model(self):
-        # Load your 3D glasses model here
-        # For example:
-        self.glasses_model = trimesh.load('glassFrame/glasses2.obj')
-        pass
+        glasses_2d = glasses_2d.reshape(-1, 2)
 
-    def process_frame(self, frame):
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_frame)
+        # Normalize the glasses coordinates
+        glasses_min = glasses_2d.min(axis=0)
+        glasses_max = glasses_2d.max(axis=0)
+        glasses_center = (glasses_min + glasses_max) / 2
+        glasses_size = glasses_max - glasses_min
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                self.render_glasses(frame, face_landmarks)
+        # Scale the glasses to match the eye distance
+        scale_factor = eye_distance / glasses_size[0]
+        glasses_2d = (glasses_2d - glasses_center) * (scale_factor)
 
-        return frame
+        # Position the glasses on the face
+        face_center = (left_eye + right_eye) / 2
+        glasses_2d += face_center
 
-    def render_glasses(self, frame, face_landmarks):
-        gl.glPushMatrix()
+        result_image = image.copy()
 
-        # 1. Extract key facial landmarks
-        mid_eye = np.array(
-            [face_landmarks.landmark[168].x, face_landmarks.landmark[168].y, face_landmarks.landmark[168].z])
-        left_eye = np.array(
-            [face_landmarks.landmark[143].x, face_landmarks.landmark[143].y, face_landmarks.landmark[143].z])
-        nose_bottom = np.array(
-            [face_landmarks.landmark[2].x, face_landmarks.landmark[2].y, face_landmarks.landmark[2].z])
-        right_eye = np.array(
-            [face_landmarks.landmark[372].x, face_landmarks.landmark[372].y, face_landmarks.landmark[372].z])
+        for face in self.glasses_model.faces:
+            points = glasses_2d[face].astype(np.int32)
+            cv2.polylines(result_image, [points], isClosed=True, color=(255, 255, 255), thickness=2)
 
-        # 2. Calculate glasses position
-        glasses_position = mid_eye
-
-        # 3. Calculate glasses orientation
-        forward = np.array([0, 0, 1])  # Assuming the glasses model faces forward along positive Z
-        up = mid_eye - nose_bottom
-        up = up / np.linalg.norm(up)  # Normalize the up vector
-        right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)  # Normalize the right vector
-        forward = np.cross(right, up)  # Recalculate forward to ensure orthogonality
-
-        # Create rotation matrix
-        rotation_matrix = np.column_stack((right, up, forward))
-
-        # 4. Calculate glasses scale
-        eye_distance = np.linalg.norm(left_eye - right_eye)
-        glasses_scale = eye_distance * 1.5  # Adjust this factor as needed
-
-        # 5. Set up OpenGL matrices
-        gl_position = (glasses_position[0] - 0.5, -glasses_position[1] + 0.5, -glasses_position[2])
-
-        # Create model matrix
-        # Use the same scale for all dimensions
-        model_matrix = pyrr.matrix44.create_from_scale([glasses_scale, glasses_scale, glasses_scale])
-        model_matrix = pyrr.matrix44.multiply(model_matrix, pyrr.matrix44.create_from_matrix33(rotation_matrix))
-        model_matrix = pyrr.matrix44.multiply(model_matrix, pyrr.matrix44.create_from_translation(gl_position))
-
-        # Apply the model matrix
-        gl.glMultMatrixf(model_matrix)
-
-        # 6. Render the glasses model
-        if self.glasses_model:
-            for mesh in self.glasses_model.geometry:
-                gl.glBegin(gl.GL_TRIANGLES)
-                for face in mesh.faces:
-                    for vertex_index in face:
-                        vertex = mesh.vertices[vertex_index]
-                        gl.glVertex3f(*vertex)
-                gl.glEnd()
-
-        gl.glPopMatrix()
-
-    def display(self):
-        success, frame = self.cap.read()
-        if success:
-            frame = self.process_frame(frame)
-
-            # Convert frame to OpenGL texture
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-            gl.glEnable(gl.GL_TEXTURE_2D)
-            texture_id = gl.glGenTextures(1)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id)
-            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGB, frame.shape[1], frame.shape[0], 0, gl.GL_BGR,
-                            gl.GL_UNSIGNED_BYTE, frame)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-
-            # Draw the texture on a quad
-            gl.glBegin(gl.GL_QUADS)
-            gl.glTexCoord2f(0, 0);
-            gl.glVertex2f(-1, -1)
-            gl.glTexCoord2f(1, 0);
-            gl.glVertex2f(1, -1)
-            gl.glTexCoord2f(1, 1);
-            gl.glVertex2f(1, 1)
-            gl.glTexCoord2f(0, 1);
-            gl.glVertex2f(-1, 1)
-            gl.glEnd()
-
-            gl.glDisable(gl.GL_TEXTURE_2D)
-            gl.glDeleteTextures([texture_id])
-
-        glut.glutSwapBuffers()
-
-    def idle(self):
-        glut.glutPostRedisplay()
+        return result_image
 
     def run(self):
-        glut.glutDisplayFunc(self.display)
-        glut.glutIdleFunc(self.idle)
-        glut.glutMainLoop()
+        while self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
 
-    def __del__(self):
+            landmarks = self.detect_face_landmarks(frame)
+            if landmarks:
+                frame = self.render_glasses(frame, landmarks)
+
+            cv2.imshow('Glasses Renderer', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
         self.cap.release()
+        cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
-    app = VirtualGlasses()
-    app.run()
+# Usage
+renderer = GlassesRenderer("glassFrame/glasses2.obj")
+renderer.run()
