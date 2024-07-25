@@ -74,6 +74,8 @@ class GlassesRenderer:
 
         left_eye = np.array([landmarks.landmark[33].x, landmarks.landmark[33].y]) * [self.width, self.height]
         right_eye = np.array([landmarks.landmark[263].x, landmarks.landmark[263].y]) * [self.width, self.height]
+        left_ear = np.array([landmarks.landmark[234].x, landmarks.landmark[234].y]) * [self.width, self.height]
+        right_ear = np.array([landmarks.landmark[454].x, landmarks.landmark[454].y]) * [self.width, self.height]
         eye_distance = np.linalg.norm(right_eye - left_eye)
 
         glasses_2d = glasses_2d.reshape(-1, 2)
@@ -84,27 +86,42 @@ class GlassesRenderer:
         glasses_center = (glasses_min + glasses_max) / 2
         glasses_size = glasses_max - glasses_min
 
-        print("Glasses Center:", glasses_center)
-        print("Glasses Size:", glasses_size)
-        print("Eye Distance:", eye_distance)
-
-        # Scale the glasses to match the eye distance
-        scale_factor = eye_distance / glasses_size[0]
+        # Scale the front part of the glasses
+        scale_factor = eye_distance / glasses_size[0] * 1.5
         glasses_2d = (glasses_2d - glasses_center) * scale_factor
 
         # Position the glasses on the face
         face_center = (left_eye + right_eye) / 2
-        glasses_2d += face_center
+        nose_bridge = np.array([landmarks.landmark[168].x, landmarks.landmark[168].y]) * [self.width, self.height]
+        vertical_offset = (nose_bridge[1] - face_center[1]) * 0.5
+        glasses_2d += face_center + [0, vertical_offset]
 
-        print("Glasses 2D after scaling:", glasses_2d.shape)
-        print("Glasses 2D min:", glasses_2d.min(axis=0))
-        print("Glasses 2D max:", glasses_2d.max(axis=0))
+        # Extend the temples
+        left_temple = glasses_2d[glasses_2d[:, 0] < face_center[0]]
+        right_temple = glasses_2d[glasses_2d[:, 0] > face_center[0]]
+
+        left_temple_end = left_temple[left_temple[:, 0].argmin()]
+        right_temple_end = right_temple[right_temple[:, 0].argmax()]
+
+        left_extension = np.linspace(left_temple_end, left_ear, num=20)
+        right_extension = np.linspace(right_temple_end, right_ear, num=20)
+
+        # Add a curve to the temples
+        left_extension[:, 1] += np.sin(np.linspace(0, np.pi, 20)) * 20
+        right_extension[:, 1] += np.sin(np.linspace(0, np.pi, 20)) * 20
+
+        glasses_2d = np.vstack((glasses_2d, left_extension, right_extension))
 
         result_image = self.image.copy()
 
+        # Draw the front part of the glasses
         for face in self.glasses_model.faces:
             points = glasses_2d[face].astype(np.int32)
-            cv2.polylines(result_image, [points], isClosed=True, color=(255, 255, 255), thickness=2)
+            cv2.fillConvexPoly(result_image, points, (0, 255, 0, 128))
+
+        # Draw the extended temples
+        cv2.polylines(result_image, [left_extension.astype(np.int32)], False, (0, 255, 0, 128), 2)
+        cv2.polylines(result_image, [right_extension.astype(np.int32)], False, (0, 255, 0, 128), 2)
 
         return result_image
 

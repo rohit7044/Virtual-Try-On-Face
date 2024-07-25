@@ -6,25 +6,13 @@ import trimesh
 
 class GlassesRenderer:
     def __init__(self, glasses_model_path):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise Exception("Could not open video device")
-
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1,
-                                                    min_detection_confidence=0.5)
-
+                                                    min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.glasses_model = trimesh.load(glasses_model_path)
 
-    def detect_face_landmarks(self, image):
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb_image)
-        if not results.multi_face_landmarks:
-            return None
-        return results.multi_face_landmarks[0]
-
-    def calculate_pose(self, landmarks, width, height):
-        # 3D model points
+    def calculate_pose(self, landmarks, image_shape):
+        height, width = image_shape[:2]
         model_points = np.array([
             (0.0, 0.0, 0.0),  # Nose tip
             (0.0, -330.0, -65.0),  # Chin
@@ -34,17 +22,15 @@ class GlassesRenderer:
             (150.0, -150.0, -125.0)  # Right mouth corner
         ])
 
-        # 2D image points
         image_points = np.array([
-            (landmarks.landmark[4].x * width, landmarks.landmark[4].y * height),  # Nose tip
-            (landmarks.landmark[152].x * width, landmarks.landmark[152].y * height),  # Chin
-            (landmarks.landmark[33].x * width, landmarks.landmark[33].y * height),  # Left eye left corner
-            (landmarks.landmark[263].x * width, landmarks.landmark[263].y * height),  # Right eye right corner
-            (landmarks.landmark[61].x * width, landmarks.landmark[61].y * height),  # Left Mouth corner
-            (landmarks.landmark[291].x * width, landmarks.landmark[291].y * height)  # Right mouth corner
+            (landmarks.landmark[4].x * width, landmarks.landmark[4].y * height),
+            (landmarks.landmark[152].x * width, landmarks.landmark[152].y * height),
+            (landmarks.landmark[33].x * width, landmarks.landmark[33].y * height),
+            (landmarks.landmark[263].x * width, landmarks.landmark[263].y * height),
+            (landmarks.landmark[61].x * width, landmarks.landmark[61].y * height),
+            (landmarks.landmark[291].x * width, landmarks.landmark[291].y * height)
         ], dtype="double")
 
-        # Camera internals
         focal_length = width
         center = (width / 2, height / 2)
         camera_matrix = np.array(
@@ -53,16 +39,15 @@ class GlassesRenderer:
              [0, 0, 1]], dtype="double"
         )
 
-        dist_coeffs = np.zeros((4, 1))  # Assuming no lens distortion
+        dist_coeffs = np.zeros((4, 1))
         (success, rotation_vector, translation_vector) = cv2.solvePnP(model_points, image_points, camera_matrix,
                                                                       dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
 
-        return rotation_vector, translation_vector, camera_matrix, dist_coeffs
+        return (rotation_vector, translation_vector, camera_matrix, dist_coeffs)
 
     def render_glasses(self, image, landmarks):
         height, width = image.shape[:2]
-        (rotation_vector, translation_vector, camera_matrix, dist_coeffs) = self.calculate_pose(landmarks, width,
-                                                                                                height)
+        (rotation_vector, translation_vector, camera_matrix, dist_coeffs) = self.calculate_pose(landmarks, image.shape)
 
         glasses_3d = self.glasses_model.vertices
         (glasses_2d, _) = cv2.projectPoints(glasses_3d, rotation_vector, translation_vector, camera_matrix, dist_coeffs)
@@ -73,46 +58,73 @@ class GlassesRenderer:
 
         glasses_2d = glasses_2d.reshape(-1, 2)
 
-        # Normalize the glasses coordinates
         glasses_min = glasses_2d.min(axis=0)
         glasses_max = glasses_2d.max(axis=0)
         glasses_center = (glasses_min + glasses_max) / 2
         glasses_size = glasses_max - glasses_min
 
-        # Scale the glasses to match the eye distance
-        scale_factor = eye_distance / glasses_size[0]
-        glasses_2d = (glasses_2d - glasses_center) * (scale_factor)
+        scale_factor = eye_distance / glasses_size[0] * 1.5  # Slightly larger than eye distance
+        glasses_2d = (glasses_2d - glasses_center) * scale_factor
 
-        # Position the glasses on the face
         face_center = (left_eye + right_eye) / 2
-        glasses_2d += face_center
+        nose_bridge = np.array([landmarks.landmark[168].x, landmarks.landmark[168].y]) * [width, height]
+        vertical_offset = (nose_bridge[1] - face_center[1]) * 0.1  # Slight vertical adjustment
+        glasses_2d += face_center + [0, vertical_offset]
 
-        result_image = image.copy()
-
+        # Create a mask for the glasses
+        mask = np.zeros(image.shape[:2], dtype=np.uint8)
         for face in self.glasses_model.faces:
             points = glasses_2d[face].astype(np.int32)
-            cv2.polylines(result_image, [points], isClosed=True, color=(255, 255, 255), thickness=2)
+            cv2.fillConvexPoly(mask, points, 255)
 
-        return result_image
+        # Create a semi-transparent overlay for the glasses
+        overlay = np.zeros_like(image)
+        glasses_color = (255, 255, 255)  # color for glasses
+        cv2.fillPoly(overlay, [glasses_2d.astype(np.int32)], glasses_color)
 
-    def run(self):
-        while self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+        # Blend the overlay with the original image
+        alpha = 1.0  # Adjust this value to change the transparency (0.0 to 1.0)
+        result = cv2.addWeighted(image, 1, overlay, alpha, 0)
 
-            landmarks = self.detect_face_landmarks(frame)
-            if landmarks:
-                frame = self.render_glasses(frame, landmarks)
+        # Apply the mask to keep only the glasses area
+        mask = cv2.merge([mask, mask, mask])
+        result = np.where(mask > 0, result, image)
 
-            cv2.imshow('Glasses Renderer', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        return result
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+    def process_frame(self, frame):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+
+        if results.multi_face_landmarks:
+            landmarks = results.multi_face_landmarks[0]
+            frame = self.render_glasses(frame, landmarks)
+
+        return frame
 
 
-# Usage
-renderer = GlassesRenderer("glassFrame/glasses2.obj")
-renderer.run()
+def main():
+    glasses_model_path = "glassFrame/glasses2.obj"  # Update this path
+    renderer = GlassesRenderer(glasses_model_path)
+
+    cap = cv2.VideoCapture(0)  # Use 0 for default camera
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            print("Ignoring empty camera frame.")
+            continue
+
+        frame = renderer.process_frame(frame)
+
+        cv2.imshow('Glasses AR', frame)
+
+        if cv2.waitKey(5) & 0xFF == 27:  # Press 'ESC' to exit
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
